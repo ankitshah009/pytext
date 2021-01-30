@@ -2,10 +2,11 @@
 # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
 from pytext.common.utils import eprint
 
-from .pytext_config import LATEST_VERSION
+from .pytext_config import LATEST_VERSION, PyTextConfig
 
 
 ADAPTERS = {}
+DOWNGRADE_ADAPTERS = {}
 NOT_THERE = (None, None, None)
 
 
@@ -19,6 +20,21 @@ def register_adapter(from_version):
             )
         else:
             ADAPTERS[from_version] = fn
+        return fn
+
+    return decorator
+
+
+def register_down_grade_adapter(from_version):
+    def decorator(fn):
+        if from_version in DOWNGRADE_ADAPTERS:
+            raise Exception(
+                "Duplicated adapter from_version={}: '{}' and '{}'".format(
+                    from_version, fn.__name__, DOWNGRADE_ADAPTERS[from_version].__name__
+                )
+            )
+        else:
+            DOWNGRADE_ADAPTERS[from_version] = fn
         return fn
 
     return decorator
@@ -465,7 +481,6 @@ def v12_to_v13(json_config):
         "SeqNNTask",
         "ShallowClassificationTask_Deprecated",
         "KDDocClassificationTask_Deprecated",
-        "ElmoFineTunePairwiseClassificationTask_Deprecated",
         "XLMDocumentClassification",
         "XLMPairClassification",
         "NewBertClassificationTask",
@@ -712,6 +727,75 @@ def upgrade_padding(json_config):
     return json_config
 
 
+@register_adapter(from_version=21)
+def upgrade_export_config(json_config):
+    """
+    Upgrade model export related config fields to the new "export" section.
+    """
+    export_config_fields = [
+        "export_caffe2_path",
+        "export_onnx_path",
+        "export_torchscript_path",
+        "torchscript_quantize",
+        "accelerate",
+        "inference_interface",
+        "seq_padding_control",
+        "batch_padding_control",
+    ]
+
+    export_config = {}
+    for f in export_config_fields:
+        if f in json_config:
+            export_config[f] = json_config.pop(f, None)
+    json_config["export"] = export_config
+    return json_config
+
+
+@register_adapter(from_version=22)
+def v22_to_v23(json_config):
+    """
+    Upgrade by adding read_chunk_size option
+    """
+    if "read_chunk_size" not in json_config:
+        json_config["read_chunk_size"] = PyTextConfig.read_chunk_size
+    return json_config
+
+
+@register_adapter(from_version=23)
+def v23_to_v24(json_config):
+    """
+    No-op since export_list is optional
+    """
+    return json_config
+
+
+@register_down_grade_adapter(from_version=23)
+def v23_to_v22(json_config):
+    """
+    Upgrade by removing read_chunk_size option
+    """
+    if "read_chunk_size" in json_config:
+        del json_config["read_chunk_size"]
+    return json_config
+
+
+@register_down_grade_adapter(from_version=24)
+def v24_to_v23(json_config):
+    """
+    Downgrade by removing export_list option
+    """
+    if "export_list" in json_config:
+        if len(json_config["export_list"]) > 1:
+            raise Exception(
+                "Current version does not support multiple exports in export_list"
+            )
+        elif len(json_config["export_list"]) == 0:
+            raise Exception("Current version does not support empty export_list")
+        json_config["export"] = json_config["export_list"][0]
+        del json_config["export_list"]
+    return json_config
+
+
 def upgrade_one_version(json_config):
     current_version = json_config.get("version", 0)
     adapter = ADAPTERS.get(current_version)
@@ -726,6 +810,20 @@ def upgrade_one_version(json_config):
     return json_config
 
 
+def downgrade_one_version(json_config):
+    current_version = json_config.get("version", 0)
+    downgrade_adapter = DOWNGRADE_ADAPTERS.get(current_version)
+    if not downgrade_adapter:
+        raise Exception(f"no downgrade adapter found for version {current_version}")
+    json_config = downgrade_adapter(json_config)
+    eprint(
+        f"WARNING - Downgrading your current config version={current_version}. "
+        "Please wait for next pytext pkg release to let new config take effect."
+    )
+    json_config["version"] = current_version - 1
+    return json_config
+
+
 def upgrade_to_latest(json_config):
     current_version = json_config.get("version") or 0
     if current_version > LATEST_VERSION:
@@ -734,6 +832,20 @@ def upgrade_to_latest(json_config):
             version {LATEST_VERSION}"
         )
     while current_version != LATEST_VERSION:
+        print(f"Current Version: {current_version}")
+        json_config = upgrade_one_version(json_config)
+        current_version = json_config["version"]
+    return json_config
+
+
+def update_to_version(json_config, expected_version=LATEST_VERSION):
+    current_version = json_config.get("version") or 0
+    if current_version > expected_version:
+        while current_version != expected_version:
+            print(f"Current Version: {current_version}")
+            json_config = downgrade_one_version(json_config)
+            current_version = json_config["version"]
+    while current_version != expected_version:
         print(f"Current Version: {current_version}")
         json_config = upgrade_one_version(json_config)
         current_version = json_config["version"]

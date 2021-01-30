@@ -2,7 +2,7 @@
 # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
 
 import re
-from typing import Optional
+from typing import List, Optional
 
 import torch
 from pytext.utils.usage import log_class_usage
@@ -46,6 +46,9 @@ class SentenceEncoder(nn.Module):
 
     def extract_features(self, tokens):
         # support passing in a single sentence
+        torch._assert(
+            tokens.dim() == 1 or tokens.dim() == 2, "tokens should be a 1D or 2D tensor"
+        )
         tokens = tokens.view(-1, tokens.shape[-1])
         return self.transformer(tokens)
 
@@ -54,11 +57,11 @@ class SentenceEncoder(nn.Module):
 
 
 class PostEncoder(SentenceEncoder):
-    def forward(self, tokens, dense):
+    def forward(self, tokens: torch.Tensor, dense: List[torch.Tensor]):
         all_layers = self.extract_features(tokens, dense)  # list of [T x B x C]
         return [layer.transpose(0, 1) for layer in all_layers]
 
-    def extract_features(self, tokens, dense):
+    def extract_features(self, tokens: torch.Tensor, dense: List[torch.Tensor]):
         # support passing in a single sentence
         tokens = tokens.view(-1, tokens.shape[-1])
         return self.transformer(tokens, dense)

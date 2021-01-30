@@ -71,7 +71,7 @@ class CompositionalMetricReporter(MetricReporter):
         super()._reset()
         self.pred_target_trees = None
 
-    def gen_extra_context(self):
+    def gen_extra_context(self, *args):
         # check if all_preds contains top K results or only 1 result
         pred_target_trees = []
         all_pred_trees: List[List[Tree]] = []
@@ -81,18 +81,22 @@ class CompositionalMetricReporter(MetricReporter):
         ):
             topk_pred_trees = []
             for k, action_preds in enumerate(top_k_action_preds):
-                pred_tree = CompositionalMetricReporter.tree_from_tokens_and_indx_actions(
-                    token_str_list,
-                    self.actions_vocab,
-                    action_preds,
-                    validate_tree=False,
+                pred_tree = (
+                    CompositionalMetricReporter.tree_from_tokens_and_indx_actions(
+                        token_str_list,
+                        self.actions_vocab,
+                        action_preds,
+                        validate_tree=False,
+                    )
                 )
                 topk_pred_trees.append(
                     CompositionalMetricReporter.tree_to_metric_node(pred_tree)
                 )
                 if k == 0:
-                    target_tree = CompositionalMetricReporter.tree_from_tokens_and_indx_actions(
-                        token_str_list, self.actions_vocab, action_targets
+                    target_tree = (
+                        CompositionalMetricReporter.tree_from_tokens_and_indx_actions(
+                            token_str_list, self.actions_vocab, action_targets
+                        )
                     )
                     pred_target_trees.append((pred_tree, target_tree))
             all_pred_trees.append(topk_pred_trees)

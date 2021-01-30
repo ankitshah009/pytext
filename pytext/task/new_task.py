@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
 
+
 from typing import Any, Dict, Optional, Type, Union
 
 import torch
 from pytext.common.constants import Stage
-from pytext.config import ConfigBase, PyTextConfig
+from pytext.config import ConfigBase, PyTextConfig, ExportConfig
 from pytext.config.component import ComponentType, create_component, create_trainer
 from pytext.data.data import Data
 from pytext.data.sources.data_source import Schema
@@ -13,11 +14,16 @@ from pytext.data.tensorizers import Tensorizer
 from pytext.metric_reporters import MetricReporter
 from pytext.models.model import BaseModel
 from pytext.trainers import TaskTrainer, TrainingState
-from pytext.utils import cuda, onnx
+from pytext.utils import cuda, onnx, precision
 from pytext.utils.file_io import PathManager
 from pytext.utils.usage import log_class_usage
 from torch import jit, sort
 
+from .accelerator_lowering import (
+    lower_modules_to_accelerator,
+    swap_modules_for_accelerator,
+)
+from .quantize import quantize_statically
 from .task import TaskBase
 
 
@@ -280,14 +286,23 @@ class _NewTask(TaskBase):
         )
 
     def torchscript_export(
-        self, model, export_path=None, sort_input=False, sort_key=1, **kwargs
+        self,
+        model,
+        export_path=None,
+        sort_input=False,
+        sort_key=1,
+        export_config=None,
     ):
-        # unpack export kwargs
-        quantize = kwargs.get("quantize", False)
-        accelerate = kwargs.get("accelerate", [])
-        seq_padding_control = kwargs.get("seq_padding_control")
-        batch_padding_control = kwargs.get("batch_padding_control")
-        inference_interface = kwargs.get("inference_interface")
+        # unpack export config
+        if export_config is None:
+            export_config = ExportConfig()
+
+        quantize = export_config.torchscript_quantize
+
+        accelerate = export_config.accelerate
+        seq_padding_control = export_config.seq_padding_control
+        batch_padding_control = export_config.batch_padding_control
+        inference_interface = export_config.inference_interface
 
         # Make sure to put the model on CPU and disable CUDA before exporting to
         # ONNX to disable any data_parallel pieces
@@ -295,6 +310,9 @@ class _NewTask(TaskBase):
         model.cpu()
         optimizer = self.trainer.optimizer
         optimizer.pre_export(model)
+
+        if "nnpi" in accelerate:
+            model = swap_modules_for_accelerator(model)
 
         # Trace needs eval mode, to disable dropout etc
         model.eval()
@@ -309,15 +327,38 @@ class _NewTask(TaskBase):
             _, sorted_indices = sort(inputs[sort_key], descending=True)
             inputs = [i.index_select(0, sorted_indices) for i in inputs]
         model(*inputs)
-        if "half" in accelerate:
-            model.half()
+
+        use_cuda_half = "cuda:half" in accelerate
+
         if quantize and hasattr(model, "graph_mode_quantize"):
             data_loader = self.data.batches(Stage.TRAIN, load_early=False)
-            trace = model.graph_mode_quantize(inputs, data_loader)
+            print("Quantizing the model ...")
+            quantize_linear_only = "nnpi_quantize" in accelerate
+            module_swap = "nnpi" in accelerate
+            trace = quantize_statically(
+                model, inputs, data_loader, quantize_linear_only, module_swap
+            )
         else:
             if quantize:
                 model.quantize()
+
             trace = model.trace(inputs)
+            print("traced!")
+
+            if use_cuda_half:
+                # convert trace to half precision
+                trace.cuda().half()
+
+                #### trace test: demonstrate that it is usable
+                precision.FP16_ENABLED = True
+                cuda.CUDA_ENABLED = True
+                unused_raw_batch, batch = next(
+                    iter(self.data.batches(Stage.TRAIN, load_early=True))
+                )
+                inputs = model.onnx_trace_input(batch)
+                assert trace(*inputs)
+                #### end of trace test
+
         if hasattr(model, "torchscriptify"):
             trace = model.torchscriptify(self.data.tensorizers, trace)
         if seq_padding_control is not None:
@@ -325,14 +366,14 @@ class _NewTask(TaskBase):
                 trace.set_padding_control("sequence_length", seq_padding_control)
             else:
                 print(
-                    "Padding_control not supported by model. Ignoring padding_control"
+                    "Padding_control not supported by model. Ignoring seq_padding_control"
                 )
         if batch_padding_control is not None:
             if hasattr(trace, "set_padding_control"):
                 trace.set_padding_control("batch_length", batch_padding_control)
             else:
                 print(
-                    "Padding_control not supported by model. Ignoring padding_control"
+                    "Padding_control not supported by model. Ignoring batch_padding_control"
                 )
         if inference_interface is not None:
             if hasattr(trace, "inference_interface"):
@@ -343,10 +384,9 @@ class _NewTask(TaskBase):
                 )
         trace.apply(lambda s: s._pack() if s._c._has_method("_pack") else None)
         if "nnpi" in accelerate:
-            trace._c = torch._C._freeze_module(
-                trace._c,
-                preservedAttrs=["make_prediction", "make_batch", "set_padding_control"],
-            )
+            print("lowering using to_glow")
+            trace = lower_modules_to_accelerator(model, trace, export_config)
+
         if export_path is not None:
             print(f"Saving torchscript model to: {export_path}")
             with PathManager.open(export_path, "wb") as f:
@@ -358,4 +398,4 @@ class NewTask(_NewTask):
     __EXPANSIBLE__ = True
 
     class Config(_NewTask.Config):
-        model: BaseModel.Config
+        model: Optional[BaseModel.Config]

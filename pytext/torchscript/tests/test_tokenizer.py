@@ -6,7 +6,7 @@ import pickle
 import unittest
 
 import torch
-from pytext.torchscript.tokenizer import ScriptBPE
+from pytext.torchscript.tokenizer import ScriptBPE, ScriptWordTokenizer
 from pytext.torchscript.utils import make_byte_inputs, utf8_chars
 
 
@@ -85,3 +85,25 @@ class BPETest(unittest.TestCase):
         self.assertIsInstance(seq_lens, torch.LongTensor)
         self.assertEqual(bytes.tolist(), expected_bytes)
         self.assertEqual(seq_lens.tolist(), expected_seq_lens)
+
+
+class WordTokenizerTest(unittest.TestCase):
+    def test_tokenizer(self) -> None:
+        lowercase = True
+        tokenizer1 = ScriptWordTokenizer(lowercase)
+        self.assertEqual(
+            tokenizer1.tokenize("Order me a coffee"),
+            [("order", 0, 5), ("me", 6, 8), ("a", 9, 10), ("coffee", 11, 17)],
+        )
+        self.assertEqual(
+            tokenizer1.tokenize("Order    me    a     coffee"),
+            [("order", 0, 5), ("me", 9, 11), ("a", 15, 16), ("coffee", 21, 27)],
+        )
+        self.assertEqual(tokenizer1.tokenize("Order"), [("order", 0, 5)])
+        lowercase = False
+        tokenizer2 = ScriptWordTokenizer(lowercase)
+        self.assertEqual(
+            tokenizer2.tokenize("Order me a coffee"),
+            [("Order", 0, 5), ("me", 6, 8), ("a", 9, 10), ("coffee", 11, 17)],
+        )
+        self.assertEqual(tokenizer2.tokenize(""), [])

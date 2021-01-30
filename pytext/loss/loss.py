@@ -69,6 +69,29 @@ class NLLLoss(Loss):
         )
 
 
+class BinaryCrossEntropyWithLogitsLoss(Loss):
+    class Config(ConfigBase):
+        reduce: bool = True
+
+    def __call__(self, logits, targets, reduce=True):
+        """
+        Computes 1-vs-all binary cross entropy loss for multiclass classification. However, unlike BinaryCrossEntropyLoss, we require targets to be a one-hot vector.
+        """
+
+        target_labels = targets[0].float()
+
+        """
+        `F.binary_cross_entropy_with_logits` requires the
+        output of the previous function be already a FloatTensor.
+        """
+
+        loss = F.binary_cross_entropy_with_logits(
+            precision.maybe_float(logits), target_labels, reduction="none"
+        )
+
+        return loss.sum(-1).mean() if reduce else loss.sum(-1)
+
+
 class BinaryCrossEntropyLoss(Loss):
     class Config(ConfigBase):
         reweight_negative: bool = True
@@ -207,8 +230,8 @@ class AUCPRHingeLoss(nn.Module, Loss):
 
     def __init__(self, config, weights=None, *args, **kwargs):
         """Args:
-            config: Config containing `precision_range_lower`, `precision_range_upper`,
-                `num_classes`, `num_anchors`
+        config: Config containing `precision_range_lower`, `precision_range_upper`,
+            `num_classes`, `num_anchors`
         """
         nn.Module.__init__(self)
         Loss.__init__(self, config)
@@ -438,14 +461,12 @@ class KLDivergenceCELoss(Loss):
             )
 
         soft_loss *= self.t ** 2  # See https://arxiv.org/pdf/1503.02531.pdf
-        hard_loss = 0.0
-        if self.hard_weight > 0.0:
-            hard_loss = F.cross_entropy(
-                logits,
-                hard_targets,
-                reduction="mean" if reduce else "none",
-                weight=self.weight,
-            )
+        hard_loss = F.nll_loss(
+            F.log_softmax(logits, 1, dtype=torch.float32),
+            hard_targets,
+            weight=self.weight,
+            reduction="mean" if reduce else "none",
+        )
 
         return (
             (1.0 - self.hard_weight) * soft_loss + self.hard_weight * hard_loss

@@ -4,17 +4,45 @@
 from typing import List, Optional, Tuple
 
 import torch
+from pytext.torchscript.utils import (
+    pad_2d,
+    pad_2d_float,
+    pad_3d_float,
+    validate_padding_control,
+)
 from pytext.torchscript.vocab import ScriptVocabulary
 
 
 class ScriptTensorizer(torch.jit.ScriptModule):
+    device: str
+    seq_padding_control: Optional[List[int]]
+    batch_padding_control: Optional[List[int]]
+
     def __init__(self):
         super().__init__()
-        self.device = torch.jit.Attribute("", str)
+        self.device = ""
+        self.seq_padding_control = torch.jit.Attribute(None, Optional[List[int]])
+        self.batch_padding_control = torch.jit.Attribute(None, Optional[List[int]])
 
     @torch.jit.script_method
     def set_device(self, device: str):
         self.device = device
+
+    @torch.jit.export
+    def set_padding_control(self, dimension: str, padding_control: Optional[List[int]]):
+        """
+        This functions will be called to set a padding style.
+        None - No padding
+        List: first element 0, round seq length to the smallest list element larger than inputs
+        """
+        if not validate_padding_control(padding_control):
+            raise RuntimeError("Malformed padding_control value")
+        if dimension == "sequence_length":
+            self.seq_padding_control = padding_control
+        elif dimension == "batch_length":
+            self.batch_padding_control = padding_control
+        else:
+            raise RuntimeError("Illegal padding dimension specified.")
 
     @torch.jit.script_method
     def tokenize(
@@ -166,3 +194,86 @@ class VocabLookup(torch.jit.ScriptModule):
             start_idxs.append(-1)
             end_idxs.append(-1)
         return token_ids, start_idxs, end_idxs
+
+
+class ScriptInteger1DListTensorizer(torch.jit.ScriptModule):
+    """
+    TorchScript implementation of Integer1DListTensorizer in pytext/data/tensorizers.py
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.pad_idx = 0
+
+    @torch.jit.script_method
+    def numberize(self, integerList: List[int]) -> Tuple[List[int], int]:
+        return integerList, len(integerList)
+
+    @torch.jit.script_method
+    def tensorize(
+        self, integerList: List[List[int]], seq_lens: List[int]
+    ) -> torch.Tensor:
+        integerListTensor = torch.tensor(
+            pad_2d(integerList, seq_lens=seq_lens, pad_idx=self.pad_idx),
+            dtype=torch.long,
+        )
+        return integerListTensor
+
+    @torch.jit.ignore
+    def torchscriptify(self):
+        return torch.jit.script(self)
+
+
+class ScriptFloat1DListTensorizer(torch.jit.ScriptModule):
+    """
+    TorchScript implementation of Float1DListTensorizer in pytext/data/tensorizers.py
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.pad_val = 1.0
+
+    @torch.jit.script_method
+    def numberize(self, floatList: List[float]) -> Tuple[List[float], int]:
+        return floatList, len(floatList)
+
+    @torch.jit.script_method
+    def tensorize(
+        self, floatLists: List[List[float]], seq_lens: List[int]
+    ) -> torch.Tensor:
+        floatListTensor = torch.tensor(
+            pad_2d_float(floatLists, seq_lens=seq_lens, pad_val=self.pad_val),
+            dtype=torch.float,
+        )
+        return floatListTensor
+
+    def torchscriptify(self):
+        return torch.jit.script(self)
+
+
+class ScriptFloatListSeqTensorizer(torch.jit.ScriptModule):
+    """
+    TorchScript implementation of ScriptFloatListSeqTensorizer in pytext/data/tensorizers.py
+    """
+
+    def __init__(self, pad_token):
+        super().__init__()
+        self.pad_val = pad_token
+
+    @torch.jit.script_method
+    def numberize(self, floatList: List[List[float]]) -> Tuple[List[List[float]], int]:
+        return (floatList, len(floatList))
+
+    @torch.jit.script_method
+    def tensorize(
+        self, floatLists: List[List[List[float]]], seq_lens: List[int]
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        floatListTensor = torch.tensor(
+            pad_3d_float(floatLists, seq_lens=seq_lens, pad_val=self.pad_val),
+            dtype=torch.float,
+        )
+        seqLensTensor = torch.tensor(seq_lens, dtype=torch.long)
+        return (floatListTensor, seqLensTensor)
+
+    def torchscriptify(self):
+        return torch.jit.script(self)

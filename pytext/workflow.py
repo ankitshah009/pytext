@@ -8,7 +8,7 @@ from typing import IO, Any, Dict, Iterator, List, Optional, Tuple, Union, get_ty
 
 import torch
 from pytext.common.constants import Stage
-from pytext.config import PyTextConfig, TestConfig
+from pytext.config import PyTextConfig, TestConfig, ExportConfig
 from pytext.config.component import ComponentType, create_component, create_exporter
 from pytext.data.data import Batcher
 from pytext.data.data_handler import CommonMetadata
@@ -161,11 +161,17 @@ def prepare_task(
     if config.load_snapshot_path:
         assert PathManager.isfile(config.load_snapshot_path)
         if config.use_config_from_snapshot:
-            task, _, training_state = load(config.load_snapshot_path)
+            task, _, training_state = load(
+                config.load_snapshot_path, rank=rank, world_size=world_size
+            )
         else:
             task, _, training_state = load(
-                config.load_snapshot_path, overwrite_config=config
+                config.load_snapshot_path,
+                overwrite_config=config,
+                rank=rank,
+                world_size=world_size,
             )
+
         if training_state:
             training_state.rank = rank
     else:
@@ -192,23 +198,32 @@ def save_and_export(
     else:
         tensorizers = task.data.tensorizers
     save(config, task.model, meta, tensorizers=tensorizers)
-    if config.export_caffe2_path:
-        task.export(
-            task.model,
-            config.export_caffe2_path,
-            metric_channels,
-            config.export_onnx_path,
-        )
-    if config.export_torchscript_path:
-        task.torchscript_export(
-            model=task.model,
-            export_path=config.export_torchscript_path,
-            quantize=config.torchscript_quantize,
-            inference_interface=config.inference_interface,
-            accelerate=config.accelerate,
-            seq_padding_control=config.seq_padding_control,
-            batch_padding_control=config.batch_padding_control,
-        )
+    if len(config.export_list) == 0:
+        export_configs = [config.export]
+    else:
+        export_configs = config.export_list
+
+    for export_config in export_configs:
+        if export_config is not None:
+            if export_config.export_caffe2_path:
+                task.export(
+                    task.model,
+                    export_config.export_caffe2_path,
+                    metric_channels,
+                    export_config.export_onnx_path,
+                )
+            if export_config.export_torchscript_path:
+                task.torchscript_export(
+                    model=task.model,
+                    export_path=export_config.export_torchscript_path,
+                    export_config=export_config,
+                )
+            if export_config.export_lite_path:
+                task.lite_export(
+                    model=task.model,
+                    export_path=export_config.export_lite_path,
+                    export_config=export_config,
+                )
 
 
 def export_saved_model_to_caffe2(
@@ -228,10 +243,10 @@ def export_saved_model_to_caffe2(
 
 
 def export_saved_model_to_torchscript(
-    saved_model_path: str, path: str, **kwargs
+    saved_model_path: str, path: str, export_config: ExportConfig
 ) -> None:
     task, train_config, _training_state = load(saved_model_path)
-    task.torchscript_export(task.model, path, **kwargs)
+    task.torchscript_export(task.model, path, False, 1, export_config=export_config)
 
 
 def test_model(
@@ -368,8 +383,7 @@ class LogitsWriter:
                 gzip_fout.close()
 
     def _get_open_options(self):
-        """We must open the file in binary model for gzip
-        """
+        """We must open the file in binary model for gzip"""
         if self.use_gzip:
             return {"mode": "wb"}
         else:
@@ -381,8 +395,7 @@ class LogitsWriter:
         gzip_fout: gzip.GzipFile,
         rows: Iterator[Any],
     ):
-        """Conditionally write to gzip or normal text file depending on the settings.
-        """
+        """Conditionally write to gzip or normal text file depending on the settings."""
         for row in rows:
             dump_row = "\t".join(json.dumps(r) for r in row)
             text = f"{dump_row}\n"

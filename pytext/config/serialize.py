@@ -175,7 +175,10 @@ def _try_component_config_from_json(cls, value):
 def pytext_config_from_json(json_obj, ignore_fields=(), auto_upgrade=True):
     if auto_upgrade:
         json_obj = upgrade_to_latest(json_obj)
-    return config_from_json(PyTextConfig, json_obj, ignore_fields)
+    pytext_config = config_from_json(PyTextConfig, json_obj, ignore_fields)
+    if len(pytext_config.export_list) == 0:
+        pytext_config.export_list = [pytext_config.export]
+    return pytext_config
 
 
 def config_from_json(cls, json_obj, ignore_fields=()):
@@ -201,6 +204,12 @@ def config_from_json(cls, json_obj, ignore_fields=()):
             detected in config json: {unknown_fields}"
         )
     for field, f_cls in cls.__annotations__.items():
+        if field in ignore_fields:
+            eprint(
+                f"Info - field: {field} in class: {cls_name} is skipped in",
+                "config_from_json because it's found in the ignore_fields.",
+            )
+            continue
         value = None
         is_optional = _is_optional(f_cls)
 
@@ -292,8 +301,7 @@ def _get_class_type(cls):
 
 
 def _is_dict(obj):
-    """support all dict-like types
-    """
+    """support all dict-like types"""
     return hasattr(obj, "__contains__") and hasattr(obj, "items")
 
 

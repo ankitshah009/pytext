@@ -13,10 +13,15 @@ from pytext.data.tensorizers import (
     Tensorizer,
     TokenTensorizer,
     UidTensorizer,
+    VocabConfig,
 )
 from pytext.data.tokenizers import DoNothingTokenizer
 from pytext.exporters.exporter import ModelExporter
-from pytext.loss import BinaryCrossEntropyLoss, MultiLabelSoftMarginLoss
+from pytext.loss import (
+    BinaryCrossEntropyLoss,
+    BinaryCrossEntropyWithLogitsLoss,
+    MultiLabelSoftMarginLoss,
+)
 from pytext.models.decoders.mlp_decoder import DecoderBase, MLPDecoder
 from pytext.models.embeddings import (
     CharacterEmbedding,
@@ -114,7 +119,7 @@ class DocModel(Model):
         )
         return exporter.export_to_caffe2(self, path, export_onnx_path=export_onnx_path)
 
-    def torchscriptify(self, tensorizers, traced_model):
+    def torchscriptify(self, tensorizers, traced_model):  # noqa
         output_layer = self.output_layer.torchscript_predictions()
 
         input_vocab = tensorizers["tokens"].vocab
@@ -249,6 +254,26 @@ class DocModel(Model):
         return decoder
 
     @classmethod
+    def create_output_layer(cls, config: Config, labels: VocabConfig):
+        label_weights = (
+            get_label_weights(labels.idx, config.output_layer.label_weights)
+            if config.output_layer.label_weights
+            else None
+        )
+        loss = create_loss(config.output_layer.loss, weight=label_weights)
+
+        if isinstance(loss, BinaryCrossEntropyLoss):
+            output_layer_cls = BinaryClassificationOutputLayer
+        elif isinstance(loss, MultiLabelSoftMarginLoss):
+            output_layer_cls = MultiLabelOutputLayer
+        elif isinstance(loss, BinaryCrossEntropyWithLogitsLoss):
+            output_layer_cls = MultiLabelOutputLayer
+        else:
+            output_layer_cls = MulticlassOutputLayer
+
+        return output_layer_cls(list(labels), loss)
+
+    @classmethod
     def from_config(cls, config: Config, tensorizers: Dict[str, Tensorizer]):
         labels = tensorizers["labels"].vocab
         if not labels:
@@ -262,21 +287,7 @@ class DocModel(Model):
             config, representation.representation_dim, len(labels)
         )
 
-        label_weights = (
-            get_label_weights(labels.idx, config.output_layer.label_weights)
-            if config.output_layer.label_weights
-            else None
-        )
-        loss = create_loss(config.output_layer.loss, weight=label_weights)
-
-        if isinstance(loss, BinaryCrossEntropyLoss):
-            output_layer_cls = BinaryClassificationOutputLayer
-        elif isinstance(loss, MultiLabelSoftMarginLoss):
-            output_layer_cls = MultiLabelOutputLayer
-        else:
-            output_layer_cls = MulticlassOutputLayer
-
-        output_layer = output_layer_cls(list(labels), loss)
+        output_layer = cls.create_output_layer(config, labels=labels)
         return cls(embedding, representation, decoder, output_layer)
 
 

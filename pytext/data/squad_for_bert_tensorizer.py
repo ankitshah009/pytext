@@ -50,14 +50,15 @@ class SquadForBERTTensorizer(BERTTensorizer):
         self.answer_starts_column = answer_starts_column
 
     def _lookup_tokens(self, text: str, seq_len: int = None):
-        # BoS token is added explicitly in numberize()
+        # BoS token is added explicitly in numberize(), -1 from max_seq_len
+        max_seq_len = (seq_len or self.max_seq_len) - 1
         return lookup_tokens(
             text,
             tokenizer=self.tokenizer,
             vocab=self.vocab,
             bos_token=None,
             eos_token=self.vocab.eos_token,
-            max_seq_len=seq_len if seq_len else self.max_seq_len,
+            max_seq_len=max_seq_len,
         )
 
     def _calculate_answer_indices(self, row, offset, start_idx, end_idx):
@@ -184,15 +185,23 @@ class SquadForBERTTensorizerForKD(SquadForBERTTensorizer):
     def numberize(self, row):
         self.total += 1
         numberized_row_tuple = super().numberize(row)
-        tup = numberized_row_tuple + (
-            self._get_token_logits(
-                row[self.start_logits_column], row[self.pad_mask_column]
-            ),
-            self._get_token_logits(
-                row[self.end_logits_column], row[self.pad_mask_column]
-            ),
-            row[self.has_answer_logits_column],
-        )
+        try:
+            tup = numberized_row_tuple + (
+                self._get_token_logits(
+                    row[self.start_logits_column], row[self.pad_mask_column]
+                ),
+                self._get_token_logits(
+                    row[self.end_logits_column], row[self.pad_mask_column]
+                ),
+                row[self.has_answer_logits_column],
+            )
+        except KeyError:
+            # Logits for KD Tensorizer not provided, using padding.
+            tup = numberized_row_tuple + (
+                [self.vocab.get_pad_index()] * len(numberized_row_tuple[0]),
+                [self.vocab.get_pad_index()] * len(numberized_row_tuple[0]),
+                [self.vocab.get_pad_index()] * 2,
+            )
 
         try:
             assert len(tup[0]) == len(tup[6])
@@ -355,15 +364,23 @@ class SquadForRoBERTaTensorizerForKD(SquadForRoBERTaTensorizer):
     def numberize(self, row):
         self.total += 1
         numberized_row_tuple = super().numberize(row)
-        tup = numberized_row_tuple + (
-            self._get_token_logits(
-                row[self.start_logits_column], row[self.pad_mask_column]
-            ),
-            self._get_token_logits(
-                row[self.end_logits_column], row[self.pad_mask_column]
-            ),
-            row[self.has_answer_logits_column],
-        )
+        try:
+            tup = numberized_row_tuple + (
+                self._get_token_logits(
+                    row[self.start_logits_column], row[self.pad_mask_column]
+                ),
+                self._get_token_logits(
+                    row[self.end_logits_column], row[self.pad_mask_column]
+                ),
+                row[self.has_answer_logits_column],
+            )
+        except KeyError:
+            # Logits for KD Tensorizer not provided, using padding.
+            tup = numberized_row_tuple + (
+                [self.vocab.get_pad_index()] * len(numberized_row_tuple[0]),
+                [self.vocab.get_pad_index()] * len(numberized_row_tuple[0]),
+                [self.vocab.get_pad_index()] * 2,
+            )
         try:
             assert len(tup[0]) == len(tup[6])
         except AssertionError:

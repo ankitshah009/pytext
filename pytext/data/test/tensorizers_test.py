@@ -26,12 +26,16 @@ from pytext.data.tensorizers import (
     AnnotationNumberizer,
     ByteTensorizer,
     ByteTokenTensorizer,
+    CharacterVocabTokenTensorizer,
+    Float1DListTensorizer,
     FloatListSeqTensorizer,
     FloatListTensorizer,
     GazetteerTensorizer,
+    Integer1DListTensorizer,
     LabelListTensorizer,
     LabelTensorizer,
     SeqTokenTensorizer,
+    String2DListTensorizer,
     TokenTensorizer,
     VocabConfig,
     VocabFileConfig,
@@ -46,6 +50,7 @@ from pytext.data.tokenizers import (
     WordPieceTokenizer,
 )
 from pytext.data.utils import Vocabulary
+from pytext.torchscript.utils import ScriptBatchInput
 from pytext.utils import precision
 from pytext.utils.test import import_tests_module
 
@@ -471,15 +476,17 @@ class TensorizersTest(unittest.TestCase):
 
     def test_create_label_tensors_add_labels(self):
         add_labels = ["add_label_1", "add_label_2"]
-        tensorizer = LabelTensorizer(label_column="label", add_labels=add_labels)
+        tensorizer = LabelTensorizer.from_config(
+            LabelTensorizer.Config(add_labels=add_labels)
+        )
         self._initialize_tensorizer(tensorizer)
         self.assertEqual(7 + len(add_labels), len(tensorizer.vocab))
 
     def test_create_label_tensors_label_vocab(self):
         add_labels = ["add_label_1", "add_label_2"]
         label_vocab = ["label_1", "label_2"]
-        tensorizer = LabelTensorizer(
-            label_column="label", label_vocab=label_vocab, add_labels=add_labels
+        tensorizer = LabelTensorizer.from_config(
+            LabelTensorizer.Config(label_vocab=label_vocab, add_labels=add_labels)
         )
         # skip initialization when using label_vocab.
         with self.assertRaises(StopIteration):
@@ -800,8 +807,8 @@ class TensorizersTest(unittest.TestCase):
             self.assertEqual(expected, numberized)
 
     def test_create_normalized_float_list_tensor(self):
-        def round_list(l):
-            return [float("%.4f" % n) for n in l]
+        def round_list(seq):
+            return [float("%.4f" % n) for n in seq]
 
         data = TSVDataSource(
             SafeFileWrapper(tests_module.test_file("train_dense_features_tiny.tsv")),
@@ -980,6 +987,156 @@ class TensorizersTest(unittest.TestCase):
         for row, expected in zip(data.train, EXPECTED_ACTIONS):
             actions = nbrz.numberize(row)
             self.assertEqual(expected, actions)
+
+    def test_integer_1D_list_tensorizer(self):
+        rows = [
+            {"1d_list": [1, 2, 3]},
+            {"1d_list": [10, 20]},
+        ]
+        expected_output = [
+            [1, 2, 3],
+            [10, 20, 0],
+        ]
+        tensorizer = Integer1DListTensorizer.from_config(
+            Integer1DListTensorizer.Config(column="1d_list")
+        )
+        self._initialize_tensorizer(tensorizer)
+
+        numberized_rows = (tensorizer.numberize(row) for row in rows)
+
+        for row, numberized in zip(rows, numberized_rows):
+            self.assertEqual(row["1d_list"], numberized)
+
+        tensorized_rows = tensorizer.tensorize(
+            [tensorizer.numberize(row) for row in rows]
+        )
+
+        assert tensorized_rows.equal(torch.tensor(expected_output, dtype=torch.long))
+
+        # Check the tensorizer after exporting to TorchScript
+        torchscript_tensorizer = tensorizer.torchscriptify()
+
+        torchscript_numberized = []
+        torchscript_lens = []
+        for row in rows:
+            numberized, length = torchscript_tensorizer.numberize(row["1d_list"])
+            self.assertEqual(numberized, row["1d_list"])
+            self.assertEqual(length, len(row["1d_list"]))
+
+            torchscript_numberized.append(numberized)
+            torchscript_lens.append(length)
+
+        torchscript_tensorized = torchscript_tensorizer.tensorize(
+            torchscript_numberized, torchscript_lens
+        )
+
+        assert torchscript_tensorized.equal(
+            torch.tensor(expected_output, dtype=torch.long)
+        )
+
+    def test_float_1D_list_tensorizer(self):
+        rows = [
+            {"1d_list": [1.5, 2.5, 3.5]},
+            {"1d_list": [10.2, 20.2]},
+        ]
+
+        expected_output = [
+            [1.5, 2.5, 3.5],
+            [10.2, 20.2, 1.0],
+        ]
+        tensorizer = Float1DListTensorizer.from_config(
+            Float1DListTensorizer.Config(column="1d_list")
+        )
+        self._initialize_tensorizer(tensorizer)
+
+        numberized_rows = (tensorizer.numberize(row) for row in rows)
+
+        for row, numberized in zip(rows, numberized_rows):
+            self.assertEqual(row["1d_list"], numberized)
+
+        tensorized_rows = tensorizer.tensorize(
+            [tensorizer.numberize(row) for row in rows]
+        )
+
+        assert tensorized_rows.equal(torch.tensor(expected_output, dtype=torch.float))
+
+        # Check the tensorizer after exporting to TorchScript
+        torchscript_tensorizer = tensorizer.torchscriptify()
+
+        torchscript_numberized = []
+        torchscript_lens = []
+        for row in rows:
+            numberized, length = torchscript_tensorizer.numberize(row["1d_list"])
+            self.assertEqual(numberized, row["1d_list"])
+            self.assertEqual(length, len(row["1d_list"]))
+
+            torchscript_numberized.append(numberized)
+            torchscript_lens.append(length)
+
+        torchscript_tensorized = torchscript_tensorizer.tensorize(
+            torchscript_numberized, torchscript_lens
+        )
+
+        assert torchscript_tensorized.equal(
+            torch.tensor(expected_output, dtype=torch.float)
+        )
+
+    def test_float_list_seq_torchscriptify(self):
+        rows = [
+            {"2d_list": [[1.5, 2.5, 3.5], [1.2, 2.2]]},
+            {"2d_list": [[10.2, 20.2], [10.1], [20.1]]},
+        ]
+
+        expected_lists = [
+            [[1.5, 2.5, 3.5], [1.2, 2.2, 1.0], [1.0, 1.0, 1.0]],
+            [
+                [10.2, 20.2, 1.0],
+                [10.1, 1.0, 1.0],
+                [20.1, 1.0, 1.0],
+            ],
+        ]
+        expected_lens = [2, 3]
+        tensorizer = FloatListSeqTensorizer.from_config(
+            FloatListSeqTensorizer.Config(column="2d_list", pad_token=1.0)
+        )
+
+        numberized_rows = (tensorizer.numberize(row) for row in rows)
+
+        for row, numberized in zip(rows, numberized_rows):
+            self.assertEqual(row["2d_list"], numberized[0])
+            self.assertEqual(len(row["2d_list"]), numberized[1])
+
+        tensorized_lists, tensorized_lens = tensorizer.tensorize(
+            [tensorizer.numberize(row) for row in rows]
+        )
+
+        assert tensorized_lists.equal(torch.tensor(expected_lists, dtype=torch.float))
+        assert tensorized_lens.equal(torch.tensor(expected_lens, dtype=torch.long))
+
+        # Check the tensorizer after exporting to TorchScript
+        torchscript_tensorizer = tensorizer.torchscriptify()
+
+        torchscript_numberized = []
+        torchscript_lens = []
+        for row in rows:
+            numberized, length = torchscript_tensorizer.numberize(row["2d_list"])
+            self.assertEqual(numberized, row["2d_list"])
+            self.assertEqual(length, len(row["2d_list"]))
+
+            torchscript_numberized.append(numberized)
+            torchscript_lens.append(length)
+
+        (
+            torchscript_tensorized_lists,
+            torchscript_tensorized_lens,
+        ) = torchscript_tensorizer.tensorize(torchscript_numberized, torchscript_lens)
+
+        assert torchscript_tensorized_lists.equal(
+            torch.tensor(expected_lists, dtype=torch.float)
+        )
+        assert torchscript_tensorized_lens.equal(
+            torch.tensor(expected_lens, dtype=torch.long)
+        )
 
 
 class BERTTensorizerTest(unittest.TestCase):
@@ -1363,3 +1520,168 @@ class SquadTensorizerTest(unittest.TestCase):
         self.assertEqual(len(doc_tokens), doc_seq_len)
         self.assertEqual(answer_start_token_idx, [-100])
         self.assertEqual(answer_end_token_idx, [-100])
+
+
+class String2DListTensorizerTest(unittest.TestCase):
+
+    init_rows = [
+        {"text": [["Move", "fast"], ["And", "break", "things", "fast"]]},
+    ]
+
+    test_rows = [
+        {"text": [["Move", "fast"], ["And", "break", "things", "fast"]]},
+        {"text": [["Move", "fast"], ["And", "break", "things", "even", "faster"]]},
+    ]
+
+    expected_numberized = [
+        ([[2, 3], [4, 5, 6, 3]], [2, 4], 2),
+        ([[2, 3], [4, 5, 6, 0, 0]], [2, 5], 2),
+    ]
+
+    expected_tensorized = (
+        torch.tensor(
+            [
+                [
+                    [2, 3, 1, 1, 1],
+                    [4, 5, 6, 3, 1],
+                ],
+                [
+                    [2, 3, 1, 1, 1],
+                    [4, 5, 6, 0, 0],
+                ],
+            ]
+        ),
+    )
+
+    def _initialize_tensorizer(self, tensorizer):
+        init = tensorizer.initialize()
+        init.send(None)
+        for row in self.init_rows:
+            init.send(row)
+        init.close()
+
+    # Test tensorizer in it's original form
+    def test_original(self):
+
+        tensorizer = String2DListTensorizer(column="text")
+        self._initialize_tensorizer(tensorizer)
+
+        numberized_rows = [tensorizer.numberize(row) for row in self.test_rows]
+
+        for expected, actual in zip(self.expected_numberized, numberized_rows):
+            self.assertEqual(expected, actual, msg="Numberized rows didn't match!")
+
+        tensors = tensorizer.tensorize(numberized_rows)
+        for expected, actual in zip(self.expected_tensorized, tensors):
+            print("COMPARE: ", expected, actual)
+            self.assertTrue(expected.equal(actual), msg="Tensors didn't match!")
+
+    # Test torchscript version of the tensorizer
+    def test_torchscriptified(self):
+
+        tensorizer = String2DListTensorizer(column="text")
+        self._initialize_tensorizer(tensorizer)
+        ts_tensorizer = tensorizer.torchscriptify()
+
+        tensors = ts_tensorizer([row["text"] for row in self.test_rows])
+
+        for expected, actual in zip(self.expected_tensorized, tensors):
+            self.assertTrue(expected.equal(actual), msg="Tensors didn't match!")
+
+
+class CharacterVocabTokenTensorizerTest(unittest.TestCase):
+    def _initialize_tensorizer(self, tensorizer, data):
+        init = tensorizer.initialize()
+        init.send(None)  # kick
+        for row in data:
+            init.send(row)
+        init.close()
+
+    def test_character_vocab_token_tensorizer(self):
+        rows = [{"text": "Move fast"}, {"text": "And break things"}]
+        expected_outputs = [
+            [
+                (
+                    "char_tokens",
+                    [[2, 3, 4, 5], [6, 7, 8, 9]],
+                ),
+                ("char_tokens_lengths", [4, 4]),
+            ],
+            [
+                (
+                    "char_tokens",
+                    [[7, 10, 11], [12, 13, 5, 7, 14], [9, 15, 16, 10, 17, 8]],
+                ),
+                ("char_tokens_lengths", [3, 5, 6]),
+            ],
+        ]
+
+        expected_tensors = (
+            [
+                [
+                    [2, 3, 4, 5, 1, 1],
+                    [6, 7, 8, 9, 1, 1],
+                    [1, 1, 1, 1, 1, 1],
+                ],
+                [
+                    [7, 10, 11, 1, 1, 1],
+                    [12, 13, 5, 7, 14, 1],
+                    [9, 15, 16, 10, 17, 8],
+                ],
+            ],
+            [[4, 4, 0], [3, 5, 6]],
+        )
+
+        tensorizer = CharacterVocabTokenTensorizer(text_column="text")
+        self._initialize_tensorizer(tensorizer, data=rows)
+        numberized_rows = [tensorizer.numberize(row) for row in rows]
+
+        for expected, numberized_row in zip(expected_outputs, numberized_rows):
+            for (field, value), out in zip(expected, numberized_row):
+                self.assertEqual(value, out, msg=f"{field} didn't match!")
+
+        tensor, tensor_lens = tensorizer.tensorize(numberized_rows)
+
+        self.assertIsInstance(tensor, torch.LongTensor)
+        self.assertIsInstance(tensor_lens, torch.LongTensor)
+        self.assertEqual(tensor.tolist(), expected_tensors[0])
+        self.assertEqual(tensor_lens.tolist(), expected_tensors[1])
+
+        # Check the tensorizer after exporting to TorchScript
+        torchscript_tensorizer = tensorizer.torchscriptify()
+
+        torchscript_numberized_rows = [
+            torchscript_tensorizer.numberize(
+                *torchscript_tensorizer.tokenize(row["text"])
+            )
+            for row in rows
+        ]
+
+        for expected, numberized_row in zip(
+            expected_outputs, torchscript_numberized_rows
+        ):
+            for (field, value), out in zip(expected, numberized_row):
+                self.assertEqual(
+                    value,
+                    out,
+                    msg=f"{field} didn't match for torchscriptified tensorizer!",
+                )
+
+        torchscript_tensor, torchscript_tensor_lens = torchscript_tensorizer.tensorize(
+            *zip(*numberized_rows)
+        )
+
+        self.assertIsInstance(torchscript_tensor, torch.LongTensor)
+        self.assertIsInstance(torchscript_tensor_lens, torch.LongTensor)
+        self.assertEqual(torchscript_tensor.tolist(), expected_tensors[0])
+        self.assertEqual(torchscript_tensor_lens.tolist(), expected_tensors[1])
+
+        # test forward
+        torchscript_tensor, torchscript_tensor_lens = torchscript_tensorizer(
+            ScriptBatchInput([[row["text"]] for row in rows], None, None)
+        )
+
+        self.assertIsInstance(torchscript_tensor, torch.LongTensor)
+        self.assertIsInstance(torchscript_tensor_lens, torch.LongTensor)
+        self.assertEqual(torchscript_tensor.tolist(), expected_tensors[0])
+        self.assertEqual(torchscript_tensor_lens.tolist(), expected_tensors[1])

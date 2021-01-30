@@ -25,6 +25,7 @@ from pytext.models.module import Module, create_module
 from pytext.models.output_layers import WordTaggingOutputLayer
 from pytext.models.representations.transformer import (
     MultiheadLinearAttention,
+    QuantizedMultiheadLinearAttention,
     MultiheadSelfAttention,
     PostEncoder,
     SELFIETransformer,
@@ -39,6 +40,7 @@ from pytext.models.representations.transformer_sentence_encoder_base import (
     PoolingMethod,
     TransformerSentenceEncoderBase,
 )
+from pytext.models.utils import normalize_embeddings
 from pytext.torchscript.module import (
     ScriptPyTextEmbeddingModuleIndex,
     ScriptPyTextModule,
@@ -49,6 +51,8 @@ from pytext.utils.usage import log_class_usage
 from torch import nn
 from torch.quantization import convert_jit, get_default_qconfig, prepare_jit
 from torch.serialization import default_restore_location
+
+from .r3f_models import R3FConfigOptions, R3FPyTextMixin
 
 
 def init_params(module):
@@ -74,7 +78,7 @@ class RoBERTaEncoderBase(TransformerSentenceEncoderBase):
         # NewBertModel expects the output as a tuple and grabs the first element
         tokens, _, _, _ = inputs
         full_representation = (
-            self.encoder(tokens, args[0]) if len(args) > 0 else self.encoder(tokens)
+            self.encoder(tokens, args) if len(args) > 0 else self.encoder(tokens)
         )
         sentence_rep = full_representation[-1][:, 0, :]
         return full_representation, sentence_rep
@@ -122,9 +126,12 @@ class RoBERTaEncoder(RoBERTaEncoderBase):
         # directly.
         is_finetuned: bool = False
         max_seq_len: int = DEFAULT_MAX_SEQUENCE_LENGTH
+        # Fine-tune bias parameters only (https://nlp.biu.ac.il/~yogo/bitfit.pdf)
+        use_bias_finetuning: bool = False
         # Linformer hyperparameters
         use_linformer_encoder: bool = False
         linformer_compressed_ratio: int = 4
+        linformer_quantize: bool = False
         export_encoder: bool = False
         variable_size_embedding: bool = True
         use_selfie_encoder: bool = False
@@ -150,21 +157,42 @@ class RoBERTaEncoder(RoBERTaEncoderBase):
 
         self.use_selfie_encoder = config.use_selfie_encoder
 
-        layers = [
-            TransformerLayer(
-                embedding_dim=config.embedding_dim,
-                attention=MultiheadLinearAttention(
-                    embed_dim=config.embedding_dim,
-                    num_heads=config.num_attention_heads,
-                    compress_layer=compress_layer,
+        if config.use_linformer_encoder:
+            if config.linformer_quantize:
+                layers = [
+                    TransformerLayer(
+                        embedding_dim=config.embedding_dim,
+                        attention=QuantizedMultiheadLinearAttention(
+                            embed_dim=config.embedding_dim,
+                            num_heads=config.num_attention_heads,
+                            compress_layer=compress_layer,
+                        ),
+                    )
+                    for _ in range(config.num_encoder_layers)
+                ]
+            else:
+                layers = [
+                    TransformerLayer(
+                        embedding_dim=config.embedding_dim,
+                        attention=MultiheadLinearAttention(
+                            embed_dim=config.embedding_dim,
+                            num_heads=config.num_attention_heads,
+                            compress_layer=compress_layer,
+                        ),
+                    )
+                    for _ in range(config.num_encoder_layers)
+                ]
+        else:
+            layers = [
+                TransformerLayer(
+                    embedding_dim=config.embedding_dim,
+                    attention=MultiheadSelfAttention(
+                        embed_dim=config.embedding_dim,
+                        num_heads=config.num_attention_heads,
+                    ),
                 )
-                if config.use_linformer_encoder
-                else MultiheadSelfAttention(
-                    embed_dim=config.embedding_dim, num_heads=config.num_attention_heads
-                ),
-            )
-            for _ in range(config.num_encoder_layers)
-        ]
+                for _ in range(config.num_encoder_layers)
+            ]
 
         self.encoder = (
             SentenceEncoder(
@@ -199,6 +227,13 @@ class RoBERTaEncoder(RoBERTaEncoderBase):
             else:
                 self.load_state_dict(roberta_state)
 
+        if config.use_bias_finetuning:
+            for (n, p) in self.encoder.named_parameters():
+                # "encoder.transformer.layers.0.attention.input_projection.weight" -> false
+                # "encoder.transformer.layers.0.attention.input_projection.bias" -> true
+                if n.split(".")[-1] != "bias":
+                    p.requires_grad_(False)
+
         self.export_encoder = config.export_encoder
         self.variable_size_embedding = config.variable_size_embedding
         self.use_linformer_encoder = config.use_linformer_encoder
@@ -228,6 +263,8 @@ class RoBERTaEncoder(RoBERTaEncoderBase):
 
         if pooled_output is not None:
             pooled_output = self.output_dropout(pooled_output)
+            if self.normalize_output_rep:
+                pooled_output = normalize_embeddings(pooled_output)
 
         output = []
         if self.output_encoded_layers:
@@ -278,15 +315,19 @@ class RoBERTa(NewBertModel):
                     tensorizer=script_tensorizer,
                 )
 
-    def graph_mode_quantize(self, inputs, data_loader, calibration_num_batches=64):
-        """Quantize the model during export with graph mode quantization for linformer encoder."""
-        if (
-            isinstance(self.encoder, RoBERTaEncoder)
-            and self.encoder.use_linformer_encoder
-        ):
+    def graph_mode_quantize(
+        self,
+        inputs,
+        data_loader,
+        calibration_num_batches=64,
+        qconfig_dict=None,
+        force_quantize=False,
+    ):
+        """Quantize the model during export with graph mode quantization."""
+        if force_quantize:
             trace = self.trace(inputs)
-            qconfig = get_default_qconfig("fbgemm")
-            qconfig_dict = {"": qconfig}
+            if not qconfig_dict:
+                qconfig_dict = {"": get_default_qconfig("fbgemm")}
             prepare_m = prepare_jit(trace, qconfig_dict, inplace=False)
             prepare_m.eval()
             with torch.no_grad():
@@ -399,3 +440,30 @@ class RoBERTaWordTaggingModel(BaseModel):
         # of the transformer.
         representation = self.encoder(encoder_inputs)[0][-1]
         return self.decoder(representation, *args)
+
+
+class RoBERTaR3F(RoBERTa, R3FPyTextMixin):
+    class Config(RoBERTa.Config):
+        r3f_options: R3FConfigOptions = R3FConfigOptions()
+
+    def get_embedding_module(self, *args, **kwargs):
+        return self.encoder.encoder.transformer.token_embedding
+
+    def original_forward(self, *args, **kwargs):
+        return RoBERTa.forward(self, *args, **kwargs)
+
+    def get_sample_size(self, model_inputs, targets):
+        return targets.size(0)
+
+    def __init__(
+        self, encoder, decoder, output_layer, r3f_options, stage=Stage.TRAIN
+    ) -> None:
+        RoBERTa.__init__(self, encoder, decoder, output_layer, stage=stage)
+        R3FPyTextMixin.__init__(self, r3f_options)
+
+    def forward(self, *args, use_r3f: bool = False, **kwargs):
+        return R3FPyTextMixin.forward(self, *args, use_r3f=use_r3f, **kwargs)
+
+    @classmethod
+    def train_batch(cls, model, batch, state=None):
+        return R3FPyTextMixin.train_batch(model=model, batch=batch, state=state)

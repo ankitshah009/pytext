@@ -7,7 +7,8 @@ import os
 # keep PathManager here for more flexibility until PathManager becomes more mature
 # in case we want some hacks in PathManager, we can do it here without updating
 # the import everywhere in PyText
-from fvcore.common.file_io import HTTPURLHandler, PathManagerBase  # noqa
+# TODO: @stevenliu use PathManagerFactory after it's released to PyPI
+from iopath.common.file_io import HTTPURLHandler, PathManager as PathManagerBase
 
 
 PathManager = PathManagerBase()
@@ -21,15 +22,14 @@ def register_http_url_handler():
 
 
 def chunk_file(file_path, chunks, work_dir):
-    """Splits a large file by line into number of chunks and writes them into work_dir
-    """
-    with open(file_path) as fin:
+    """Splits a large file by line into number of chunks and writes them into work_dir"""
+    with PathManager.open(file_path) as fin:
         num_lines = sum(1 for line in fin)
 
     chunk_size = math.ceil(num_lines / chunks)
     output_file_paths = []
     with contextlib.ExitStack() as stack:
-        fin = stack.enter_context(open(file_path))
+        fin = stack.enter_context(PathManager.open(file_path))
         for i, line in enumerate(fin):
             if not i % chunk_size:
                 file_split = "{}.chunk_{}".format(

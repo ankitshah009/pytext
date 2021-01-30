@@ -4,6 +4,7 @@ from typing import Dict, Union
 
 import torch
 from pytext.common.constants import Stage
+from pytext.config import ExportConfig
 from pytext.config.component import create_trainer
 from pytext.data.bert_tensorizer import BERTTensorizer
 from pytext.data.data import Data
@@ -30,7 +31,10 @@ from pytext.metric_reporters.seq2seq_compositional import (
     Seq2SeqCompositionalMetricReporter,
 )
 from pytext.models.bert_classification_models import NewBertModel
-from pytext.models.bert_regression_model import NewBertRegressionModel
+from pytext.models.bert_regression_model import (
+    BertPairwiseRegressionModel,
+    NewBertRegressionModel,
+)
 from pytext.models.doc_model import DocModel, DocRegressionModel
 from pytext.models.ensembles import BaggingDocEnsembleModel, EnsembleModel
 from pytext.models.joint_model import IntentSlotModel
@@ -100,7 +104,7 @@ class DocumentClassificationTask(NewTask):
         model: BaseModel.Config = DocModel.Config()
         metric_reporter: Union[
             ClassificationMetricReporter.Config, PureLossMetricReporter.Config
-        ] = (ClassificationMetricReporter.Config())
+        ] = ClassificationMetricReporter.Config()
         #   for multi-label classification task,
         #   choose MultiLabelClassificationMetricReporter
 
@@ -180,9 +184,7 @@ class MaskedLMTask(NewTask):
     class Config(NewTask.Config):
         data: Data.Config = PackedLMData.Config()
         model: MaskedLanguageModel.Config = MaskedLanguageModel.Config()
-        metric_reporter: MaskedLMMetricReporter.Config = (
-            MaskedLMMetricReporter.Config()
-        )
+        metric_reporter: MaskedLMMetricReporter.Config = MaskedLMMetricReporter.Config()
 
 
 class PairwiseClassificationTask(NewTask):
@@ -220,13 +222,17 @@ class PairwiseClassificationTask(NewTask):
         super().__init__(data, model, metric_reporter, trainer)
         self.trace_both_encoders = trace_both_encoders
 
-    def torchscript_export(self, model, export_path=None, **kwargs):
-        # unpack export kwargs
-        quantize = kwargs.get("quantize", False)
-        accelerate = kwargs.get("accelerate", [])
-        seq_padding_control = kwargs.get("seq_padding_control")
-        batch_padding_control = kwargs.get("batch_padding_control")
-        inference_interface = kwargs.get("inference_interface")
+    def torchscript_export(self, model, export_path=None, export_config=None):  # noqa
+        # unpack export config
+        # unpack export config
+        if export_config is None:
+            export_config = ExportConfig()
+
+        quantize = export_config.torchscript_quantize
+        accelerate = export_config.accelerate
+        seq_padding_control = export_config.seq_padding_control
+        batch_padding_control = export_config.batch_padding_control
+        inference_interface = export_config.inference_interface
 
         cuda.CUDA_ENABLED = False
         model.cpu()
@@ -243,7 +249,7 @@ class PairwiseClassificationTask(NewTask):
         model(*inputs)
         if quantize:
             model.quantize()
-        if "half" in accelerate:
+        if accelerate is not None and "half" in accelerate:
             model.half()
         if self.trace_both_encoders:
             trace = jit.trace(model, inputs)
@@ -275,7 +281,7 @@ class PairwiseClassificationTask(NewTask):
                     "inference_interface not supported by model. Ignoring inference_interface"
                 )
         trace.apply(lambda s: s._pack() if s._c._has_method("_pack") else None)
-        if "nnpi" in accelerate:
+        if accelerate is not None and "nnpi" in accelerate:
             trace._c = torch._C._freeze_module(
                 trace._c,
                 preservedAttrs=["make_prediction", "make_batch", "set_padding_control"],
@@ -285,6 +291,14 @@ class PairwiseClassificationTask(NewTask):
             with PathManager.open(export_path, "wb") as f:
                 torch.jit.save(trace, f)
         return trace
+
+
+class PairwiseRegressionTask(PairwiseClassificationTask):
+    class Config(PairwiseClassificationTask.Config):
+        model: BasePairwiseModel.Config = BertPairwiseRegressionModel.Config()
+        metric_reporter: RegressionMetricReporter.Config = (
+            RegressionMetricReporter.Config()
+        )
 
 
 class PairwiseClassificationForDenseRetrievalTask(PairwiseClassificationTask):
@@ -366,7 +380,7 @@ class SequenceLabelingTask(NewTask):
             Seq2SeqCompositionalMetricReporter.Config()
         )
 
-    def torchscript_export(self, model, export_path=None, **kwargs):
+    def torchscript_export(self, model, export_path=None, export_config=None):
         model.cpu()
         # Trace needs eval mode, to disable dropout etc
         model.eval()

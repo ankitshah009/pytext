@@ -94,6 +94,7 @@ class StochasticWeightAveraging(Optimizer, PT_Optimizer):
 
         self.optimizer = optimizer
 
+        self.defaults = self.optimizer.defaults
         self.param_groups = self.optimizer.param_groups
         self.state = defaultdict(dict)
         self.opt_state = self.optimizer.state
@@ -152,8 +153,7 @@ class StochasticWeightAveraging(Optimizer, PT_Optimizer):
         group["n_avg"] += 1
 
     def update_swa(self):
-        r"""Updates the SWA running averages of all optimized parameters.
-        """
+        r"""Updates the SWA running averages of all optimized parameters."""
         for group in self.param_groups:
             self.update_swa_group(group)
 
@@ -181,7 +181,7 @@ class StochasticWeightAveraging(Optimizer, PT_Optimizer):
                 buf.copy_(tmp)
         return True
 
-    def step(self, closure=None):
+    def step(self, closure=None, **kwargs):
         r"""Performs a single optimization step.
 
         In automatic mode also updates SWA running averages.
@@ -303,6 +303,10 @@ class StochasticWeightAveraging(Optimizer, PT_Optimizer):
     def from_config(cls, config: Config, model: torch.nn.Module):
         base_opt = create_optimizer(config.optimizer, model)
         return cls(base_opt, config.start, config.frequency, config.swa_learning_rate)
+
+    def reset_param_groups(self):
+        self.param_groups = []
+        self.param_groups = self.optimizer.param_groups
 
 
 # BatchNorm utils

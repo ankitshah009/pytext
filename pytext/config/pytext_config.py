@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
+import logging
 from collections import OrderedDict
 from typing import Any, List, Optional, Union
 
@@ -83,32 +84,15 @@ class PlaceHolder:
     pass
 
 
-class PyTextConfig(ConfigBase):
-    # the actual task union types will be generated in runtime
-    task: Union[PlaceHolder, Any]
-    use_cuda_if_available: bool = True
-    # Enable mixed precision training. WARNING: under develoment
-    use_fp16: bool = False
-    # Total Number of GPUs to run the training on (for CPU jobs this has to be 1)
-    distributed_world_size: int = 1
-    # Total number of GPU streams for gradient sync in distributed training
-    gpu_streams_for_distributed_training: int = 1
-    # load either model or checkpoint(model + config + training_state etc)
-    # load model file for inference only, load checkpont file to continue training
-    load_snapshot_path: str = ""
-    # Where to save the trained pytorch model and checkpoints
-    save_snapshot_path: str = "/tmp/model.pt"
-    # True: use the config saved in snapshot. False: use config from current task
-    use_config_from_snapshot: bool = True
-    # if there are existing snapshots in parent directory of save_snapshot_path
-    # resume training from the latest snapshot automatically
-    auto_resume_from_snapshot: bool = False
+class ExportConfig(ConfigBase):
     # Exported caffe model will be stored here
     export_caffe2_path: Optional[str] = None
     # Exported onnx model will be stored here
     export_onnx_path: str = "/tmp/model.onnx"
     # Exported torchscript model will be stored here
     export_torchscript_path: Optional[str] = None
+    # Exported jit lite model will be stored here
+    export_lite_path: Optional[str] = None
     # Export quantized torchscript model
     torchscript_quantize: Optional[bool] = False
     # Accelerator options.
@@ -136,6 +120,39 @@ class PyTextConfig(ConfigBase):
     # The list of padding boundaries must be sorted in asecending order.
     # The first list element must be 0.  (Will serve as future padding control "version number")
     batch_padding_control: Optional[List[int]] = None
+
+
+class InvalidMethodInvocation(Exception):
+    message: str
+
+    def __init__(self, message):
+        self.message = message
+
+
+class PyTextConfig(ConfigBase):
+    # the actual task union types will be generated in runtime
+    task: Union[PlaceHolder, Any]
+    use_cuda_if_available: bool = True
+    # Enable mixed precision training. WARNING: under develoment
+    use_fp16: bool = False
+    # Total Number of GPUs to run the training on (for CPU jobs this has to be 1)
+    distributed_world_size: int = 1
+    # Total number of GPU streams for gradient sync in distributed training
+    gpu_streams_for_distributed_training: int = 1
+    # load either model or checkpoint(model + config + training_state etc)
+    # load model file for inference only, load checkpont file to continue training
+    load_snapshot_path: str = ""
+    # Where to save the trained pytorch model and checkpoints
+    save_snapshot_path: str = "/tmp/model.pt"
+    # True: use the config saved in snapshot. False: use config from current task
+    use_config_from_snapshot: bool = True
+    # if there are existing snapshots in parent directory of save_snapshot_path
+    # resume training from the latest snapshot automatically
+    auto_resume_from_snapshot: bool = False
+    # Configuration for model export. See ExportConfig for details
+    export: ExportConfig = ExportConfig()
+    # Configuration for a list of model exports. If the list is non-empty, export will be ignored.
+    export_list: List[ExportConfig] = []
     # Base directory where modules are saved
     modules_save_dir: str = ""
     # Whether to save intermediate checkpoints for modules if they are best yet
@@ -163,10 +180,176 @@ class PyTextConfig(ConfigBase):
     # parameter has no effect.
     use_cuda_for_testing: bool = True
 
+    # When reading large files(in manifold), PathManager will read by chunks
+    # The memory usage can be estimated by: read_chunk_size * num_process
+    # If you got Out-of-Memory issue due to using many GPUs(1 process/GPU),
+    # you can decrease read_chunk_size to reduce memory usage
+    read_chunk_size: Optional[int] = 1000 ** 3  # 1GB
+
     # TODO these two configs are only kept only to be backward comptible with
     # RNNG, should be removed once RNNG refactoring is done
     test_out_path: str = "/tmp/test_out.txt"
     debug_path: str = "/tmp/model.debug"
+
+    def __init__(self, **kwargs):
+        version = kwargs["version"]
+        if version < 22:
+            assert "export" not in kwargs, (
+                'Config versions before 22 should not contain an "export" section. Got '
+                f"version={version}."
+            )
+            kwargs["export"] = ExportConfig(
+                **{
+                    k: kwargs.pop(k)
+                    for k in ExportConfig.__annotations__.keys()
+                    if k in kwargs.keys()
+                }
+            )
+            kwargs["export_list"] = [kwargs["export"]]
+            kwargs["version"] = 22
+        super().__init__(**kwargs)
+        if len(self.export_list) == 0:  # Happens if version >= 22:
+            self.export_list = [self.export]
+
+    def export_check(self, method_name):
+        if len(self.export_list) != 1:
+            if len(self.export_list) == 0:
+                # Is there a proper finalizer that can be called instead??
+                # Need help from a python Guru
+                self.export_list = [self.export]
+            else:
+                raise InvalidMethodInvocation(
+                    "export list length is not 1  use the set/get_%s version of method with key"
+                    % (method_name,)
+                )
+
+    @property
+    def export_caffe2_path(self):
+        self.export_check("export_caffe2_path")
+        return self.export_list[0].export_caffe2_path
+
+    @export_caffe2_path.setter
+    def export_caffe2_path(self, p):
+        self.export_check("export_caffe2_path")
+        self.export_list[0].export_caffe2_path = p
+
+    def get_export_caffe2_path(self, index):
+        return self.export_list[index].export_caffe2_path
+
+    def set_export_caffe2_path(self, p, index):
+        self.export_list[index].export_caffe2_path = p
+
+    @property
+    def export_onnx_path(self):
+        self.export_check("export_onnx_path")
+        return self.export_list[0].export_onnx_path
+
+    @export_onnx_path.setter
+    def export_onnx_path(self, p):
+        self.export_check("export_onnx_path")
+        self.export_list[0].export_onnx_path = p
+
+    def get_export_onnx_path(self, index):
+        return self.export_list[index].export_onnx_path
+
+    def set_export_onnx_path(self, p, index):
+        self.export_list[index].export_onnx_path = p
+
+    @property
+    def export_torchscript_path(self):
+        self.export_check("export_torchscript_path")
+        return self.export_list[0].export_torchscript_path
+
+    @export_torchscript_path.setter
+    def export_torchscript_path(self, p):
+        self.export_check("export_torchscript_path")
+        self.export_list[0].export_torchscript_path = p
+
+    def get_export_torchscript_path(self, index):
+        return self.export_list[index].export_torchscript_path
+
+    def set_export_torchscript_path(self, p, index):
+        self.export_list[index].export_torchscript_path = p
+
+    @property
+    def torchscript_quantize(self):
+        self.export_check("torchscript_quantize")
+        return self.export_list[0].torchscript_quantize
+
+    @torchscript_quantize.setter
+    def torchscript_quantize(self, quantize):
+        self.export_check("torchscript_quantize")
+        self.export_list[0].torchscript_quantize = quantize
+
+    def get_export_torchscript_quantize(self, index):
+        return self.export_list[index].torchscript_quantize
+
+    def set_export_torchscript_path(self, quantize, index):
+        self.export_list[index].torchscript_quantize = quantize
+
+    @property
+    def accelerate(self):
+        self.export_check("accelerate")
+        return self.export_list[0].accelerate
+
+    @accelerate.setter
+    def accelerate(self, acc):
+        self.export_check("accelerate")
+        self.export_list[0].accelerate = acc
+
+    def get_export_accelerate(self, index):
+        return self.export_list[index].accelerate
+
+    def set_export_accelerate(self, acc, index):
+        self.export_list[index].accelerate = acc
+
+    @property
+    def inference_interface(self):
+        self.export_check("inference_interface")
+        return self.export_list[0].inference_interface
+
+    @inference_interface.setter
+    def inference_interface(self, inf_inter):
+        self.export_check("inference_interface")
+        self.export_list[0].inference_interface = inf_inter
+
+    def get_export_inference_interface(self, index):
+        return self.export_list[index].inference_interface
+
+    def set_export_inference_interface(self, inference_interface, index):
+        self.export_list[index].inference_interface = inference_interface
+
+    @property
+    def seq_padding_control(self):
+        self.export_check("seq_padding_control")
+        return self.export_list[0].seq_padding_control
+
+    @seq_padding_control.setter
+    def seq_padding_control(self, spc):
+        self.export_check("seq_padding_control")
+        self.export_list[0].seq_padding_control = spc
+
+    def get_export_seq_padding_control(self, index):
+        return self.export_list[index].seq_padding_control
+
+    def set_export_inference_interface(self, seq_padding_control, index):
+        self.export_list[index].seq_padding_control = seq_padding_control
+
+    @property
+    def batch_padding_control(self):
+        self.export_check("batch_padding_control")
+        return self.export_list[0].batch_padding_control
+
+    @batch_padding_control.setter
+    def batch_padding_control(self, bpc):
+        self.export_check("batch_padding_control")
+        self.export_list[0].batch_padding_control = bpc
+
+    def get_export_batch_padding_control(self, index):
+        return self.export_list[index].batchpadding_control
+
+    def set_export_batch_padding_control(self, batch_padding_control, index):
+        self.export_list[index].batch_padding_control = batch_padding_control
 
 
 class TestConfig(ConfigBase):
@@ -182,6 +365,8 @@ class TestConfig(ConfigBase):
     use_tensorboard: bool = True
     # Output path where metric reporter writes to.
     test_out_path: str = ""
+    # Enable mixed precision training. WARNING: under develoment
+    use_fp16: bool = False
 
 
 class LogitsConfig(TestConfig):
@@ -203,4 +388,5 @@ class LogitsConfig(TestConfig):
     fp16: bool = False
 
 
-LATEST_VERSION = 21
+# update sitevar PYTEXT_CONFIG_LATEST_VERSION when new PytextConfig pushed in pytext config
+LATEST_VERSION = 24

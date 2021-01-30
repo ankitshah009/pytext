@@ -12,6 +12,7 @@ from pytext.fields import FieldMeta
 from pytext.loss import (
     AUCPRHingeLoss,
     BinaryCrossEntropyLoss,
+    BinaryCrossEntropyWithLogitsLoss,
     CrossEntropyLoss,
     KLDivergenceBCELoss,
     KLDivergenceCELoss,
@@ -43,6 +44,7 @@ class ClassificationOutputLayer(OutputLayerBase):
         loss: Union[
             CrossEntropyLoss.Config,
             BinaryCrossEntropyLoss.Config,
+            BinaryCrossEntropyWithLogitsLoss.Config,
             MultiLabelSoftMarginLoss.Config,
             AUCPRHingeLoss.Config,
             KLDivergenceBCELoss.Config,
@@ -82,6 +84,8 @@ class ClassificationOutputLayer(OutputLayerBase):
         if isinstance(loss, BinaryCrossEntropyLoss):
             cls = BinaryClassificationOutputLayer
         elif isinstance(loss, MultiLabelSoftMarginLoss):
+            cls = MultiLabelOutputLayer
+        elif isinstance(loss, BinaryCrossEntropyWithLogitsLoss):
             cls = MultiLabelOutputLayer
         else:
             cls = MulticlassOutputLayer

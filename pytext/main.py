@@ -14,8 +14,9 @@ import torch
 from pytext import create_predictor
 from pytext.builtin_task import add_include
 from pytext.common.utils import eprint
-from pytext.config import LATEST_VERSION, PyTextConfig
+from pytext.config import LATEST_VERSION, ExportConfig, PyTextConfig
 from pytext.config.component import register_tasks
+from pytext.config.config_adapter import upgrade_to_latest
 from pytext.config.serialize import (
     config_to_json,
     parse_config,
@@ -24,6 +25,7 @@ from pytext.config.serialize import (
 from pytext.config.utils import find_param, replace_param
 from pytext.data.data_handler import CommonMetadata
 from pytext.metric_reporters.channel import Channel, TensorBoardChannel
+from pytext.PreprocessingMap.ttypes import ModelType
 from pytext.task import load
 from pytext.utils.documentation import (
     ROOT_CONFIG,
@@ -48,6 +50,54 @@ from torch.multiprocessing.spawn import spawn
 class Attrs:
     def __repr__(self):
         return f"Attrs({', '.join(f'{k}={v}' for k, v in vars(self).items())})"
+
+
+def _validate_export_json_config(export_json_config):
+    """Validate if the input export_json_config (PyTextConfig in JSON object) only has
+    export section config and a version number.
+    """
+    assert (export_json_config.keys() <= {"export", "version", "read_chunk_size"}) or (
+        export_json_config.keys() <= {"export_list", "version", "read_chunk_size"}
+    ), (
+        "The export-json config should only contain fields (export or export_list),  version and read_chunk_size. Got "
+        f"{export_json_config.keys()}"
+    )
+    assert {"export", "version"} <= export_json_config.keys(), (
+        "The export-json must contain fields export and version. Got "
+        f"{export_json_config.keys()}"
+    )
+
+    if "export" in export_json_config.keys():
+        for key in export_json_config["export"]:
+            assert (
+                key in ExportConfig.__annotations__.keys()
+            ), f"Field {key} in the export json is not found in the ExportConfig class."
+    else:  # export_list instead of export
+        assert "export_list" in export_json_config.keys()
+        found_model_type = None
+        for export_config in export_json_config["export_list"]:
+            for key in export_config:
+                assert (
+                    key in ExportConfig.__annotations__.keys()
+                ), f"Field {key} in the export json is not found in the ExportConfig class."
+            this_model_type = (
+                ModelType.PYTORCH
+                if "export_pytorch_path" in export_config
+                else ModelType.CAFFE2
+            )
+            assert (found_model_type is None) or (found_model_type == this_model_type)
+            if found_model_type is None:
+                found_model_type = this_model_type
+
+
+def _load_and_validate_export_json_config(export_json):
+    with PathManager.open(export_json) as fp:
+        export_json_config = json.load(fp)
+        if "config" in export_json_config:
+            export_json_config = export_json_config["config"]
+        export_json_config = upgrade_to_latest(export_json_config)
+        _validate_export_json_config(export_json_config)
+        return export_json_config
 
 
 def train_model_distributed(config, metric_channels: Optional[List[Channel]]):
@@ -229,8 +279,8 @@ def main(context, config_file, config_json, config_module, include):
 @click.pass_context
 def help_config(context, class_name):
     """
-        Find all the classes matching `class_name`, and
-        pretty-print each matching class field members (non-recursively).
+    Find all the classes matching `class_name`, and
+    pretty-print each matching class field members (non-recursively).
     """
     found_classes = find_config_class(class_name)
     if found_classes:
@@ -247,9 +297,9 @@ def help_config(context, class_name):
 @click.pass_context
 def gen_default_config(context, task_name, options):
     """
-        Generate a config for `task_name` with default values.
-        Optionally, override the defaults by passing your desired
-        components as `options`.
+    Generate a config for `task_name` with default values.
+    Optionally, override the defaults by passing your desired
+    components as `options`.
     """
     try:
         cfg = gen_config_impl(task_name, *options)
@@ -276,7 +326,7 @@ def gen_default_config(context, task_name, options):
 @click.pass_context
 def update_config(context):
     """
-        Load a config file, update to latest version and prints the result.
+    Load a config file, update to latest version and prints the result.
     """
     config = context.obj.load_config()
     config_json = config_to_json(PyTextConfig, config)
@@ -381,35 +431,116 @@ def train(context):
 
 
 @main.command()
+@click.option("--export-json", help="the path to the export options in JSON format.")
 @click.option("--model", help="the pytext snapshot model file to load")
 @click.option("--output-path", help="where to save the exported caffe2 model")
 @click.option("--output-onnx-path", help="where to save the exported onnx model")
 @click.pass_context
-def export(context, model, output_path, output_onnx_path):
+def export(context, export_json, model, output_path, output_onnx_path):
     """Convert a pytext model snapshot to a caffe2 model."""
-    if not model:
-        config = context.obj.load_config()
-        model = config.save_snapshot_path
-        output_path = config.export_caffe2_path
-        output_onnx_path = config.export_onnx_path
-    print(
-        f"Exporting {model} to caffe2 file: {output_path} and onnx file: {output_onnx_path}"
-    )
-    export_saved_model_to_caffe2(model, output_path, output_onnx_path)
+    # only populate from export_json if no export option is configured from the command line.
+    if export_json:
+        if not output_path and not output_onnx_path:
+            export_json_config = _load_and_validate_export_json_config(export_json)
+            export_section_config = export_json_config["export"]
+            if "export_caffe2_path" in export_section_config:
+                output_path = export_section_config["export_caffe2_path"]
+            if "export_onnx_path" in export_section_config:
+                output_onnx_path = export_section_config["export_onnx_path"]
+        else:
+            print(
+                "the export-json config is ignored because export options are found the command line"
+            )
+    config = context.obj.load_config()
+    export_list = config.export_list
+    model = model or config.save_snapshot_path
+    if len(export_list) == 0:
+        output_path = output_path or config.export_caffe2_path
+        output_onnx_path = output_onnx_path or config.export_onnx_path
+        print(
+            f"Exporting {model} to caffe2 file: {output_path} and onnx file: {output_onnx_path}"
+        )
+        export_saved_model_to_caffe2(model, output_path, output_onnx_path)
+    else:
+        for idx in range(0, len(export_list)):
+            output_path = output_path or config.get_export_caffe2_path(idx)
+            output_onnx_path = output_onnx_path or config.get_export_onnx_path(idx)
+            print(
+                f"Exporting {model} to caffe2 file: {output_path} and onnx file: {output_onnx_path}"
+            )
+            export_saved_model_to_caffe2(model, output_path, output_onnx_path)
 
 
 @main.command()
+@click.option("--export-json", help="the path to the export options in JSON format.")
 @click.option("--model", help="the pytext snapshot model file to load")
 @click.option("--output-path", help="where to save the exported torchscript model")
 @click.option("--quantize", help="whether to quantize the model")
 @click.pass_context
-def torchscript_export(context, model, output_path=None, **kwargs):
+def torchscript_export(context, export_json, model, output_path, quantize):
     """Convert a pytext model snapshot to a torchscript model."""
-    config = context.obj.load_config()
-    model = model or config.save_snapshot_path
-    output_path = output_path or f"{config.save_snapshot_path}.torchscript"
-    print(f"Exporting {model} to torchscript file: {output_path}")
-    export_saved_model_to_torchscript(model, output_path, **kwargs)
+    export_config = ExportConfig()
+    # only populate from export_json if no export option is configured from the command line.
+    if export_json:
+        export_json_config = _load_and_validate_export_json_config(export_json)
+
+        read_chunk_size = export_json_config.pop("read_chunk_size", None)
+        if read_chunk_size is not None:
+            print("Warning: Ignoring read_chunk_size.")
+
+        if export_json_config.get("read_chunk_size", None) is not None:
+            print("Error: Do not know what to do with read_chunk_size.  Ignoring.")
+
+        if "export_list" not in export_json_config.keys():
+            export_section_config_list = [export_json_config["export"]]
+        else:
+            export_section_config_list = export_json_config["export_list"]
+
+        for export_section_config in export_section_config_list:
+            if not quantize and not output_path:
+                export_config.export_caffe2_path = export_section_config.get(
+                    "export_caffe2_path", None
+                )
+                export_config.export_onnx_path = export_section_config.get(
+                    "export_onnx_path", "/tmp/model.onnx"
+                )
+                export_config.torchscript_quantize = export_section_config.get(
+                    "torchscript_quantize", False
+                )
+
+            else:
+                print(
+                    "the export-json config is ignored because export options are found the command line"
+                )
+                export_config.torchscript_quantize = quantize
+
+            export_config.export_torchscript_path = export_section_config.get(
+                "export_torchscript_path", None
+            )
+            # if config has export_torchscript_path, use export_torchscript_path from config, otherwise keep the default from CLI
+            if export_config.export_torchscript_path is not None:
+                output_path = export_config.export_torchscript_path
+
+            export_config.export_lite_path = export_section_config.get(
+                "export_lite_path", None
+            )
+            export_config.inference_interface = export_section_config.get(
+                "inference_interface", None
+            )
+            export_config.accelerate = export_section_config.get("accelerate", [])
+            export_config.seq_padding_control = export_section_config.get(
+                "seq_padding_control", None
+            )
+            export_config.batch_padding_control = export_section_config.get(
+                "batch_padding_control", None
+            )
+            if not model or not output_path:
+                config = context.obj.load_config()
+                model = model or config.save_snapshot_path
+                output_path = output_path or f"{config.save_snapshot_path}.torchscript"
+
+            print(f"Exporting {model} to torchscript file: {output_path}")
+            export_saved_model_to_torchscript(model, output_path, export_config)
 
 
 @main.command()
@@ -515,8 +646,7 @@ def get_logits(
     use_gzip,
     device_id,
 ):
-    """print logits from  a trained model snapshot to output_path
-    """
+    """print logits from  a trained model snapshot to output_path"""
 
     model_snapshot, use_cuda, _ = _get_model_snapshot(
         context, model_snapshot, use_cuda, False

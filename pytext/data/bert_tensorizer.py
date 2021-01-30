@@ -167,10 +167,19 @@ class BERTTensorizerBaseScriptImpl(TensorizerScriptImpl):
             batch_padding_control=self.batch_padding_control,
         )
         segment_labels = torch.tensor(
-            pad_2d(segment_labels_2d, seq_lens=seq_lens_1d, pad_idx=0), dtype=torch.long
+            pad_2d(
+                segment_labels_2d,
+                seq_lens=seq_lens_1d,
+                pad_idx=0,
+                max_len=self.max_seq_len,
+            ),
+            dtype=torch.long,
         )
         positions = torch.tensor(
-            pad_2d(positions_2d, seq_lens=seq_lens_1d, pad_idx=0), dtype=torch.long
+            pad_2d(
+                positions_2d, seq_lens=seq_lens_1d, pad_idx=0, max_len=self.max_seq_len
+            ),
+            dtype=torch.long,
         )
         if self.device == "":
             return tokens, pad_mask, segment_labels, positions
@@ -201,7 +210,7 @@ class BERTTensorizerBaseScriptImpl(TensorizerScriptImpl):
         pre-processed tokens.
 
         Returns:
-            per_sentence_tokens: tokens per setence level, each token is
+            per_sentence_tokens: tokens per sentence level, each token is
             represented by token(str), start and end indices.
         """
         per_sentence_tokens: List[List[Tuple[str, int, int]]] = []
@@ -336,6 +345,7 @@ class BERTTensorizerScriptImpl(BERTTensorizerBaseScriptImpl):
     ) -> Tuple[List[int], List[int], List[int]]:
         if max_seq_len is None:
             max_seq_len = self.max_seq_len
+        max_seq_len -= 1  # because _wrap_numberized_tokens adds a token
 
         return self.vocab_lookup(
             tokens,
